@@ -1,0 +1,879 @@
+# nokvm-reinstall
+
+Safely bootstrap a remote Debian reinstall on servers without KVM, IPMI, iDRAC, iLO, or other out-of-band console access.
+
+`nokvm-reinstall` prepares a Debian 13 installer on an existing Linux system, adds it as a **one-shot GRUB boot entry**, and starts Debian Installer's SSH `network-console`.
+
+The destructive part of the installation remains intentionally interactive.
+
+> **Current version:** `0.2.0`  
+> **Current target:** Debian 13 (trixie), amd64/x86_64
+
+---
+
+## Why?
+
+Reinstalling a remote server is easy when you have:
+
+- KVM over IP
+- IPMI
+- iDRAC / iLO
+- provider rescue console
+- virtual media
+
+It becomes much more dangerous when SSH is your only access path.
+
+`nokvm-reinstall` is designed for that situation.
+
+Instead of immediately wiping the system, it uses the existing Linux installation to prepare a Debian netboot installer:
+
+```text
+Existing Linux
+      |
+      | prepare Debian Installer
+      | create one-shot GRUB entry
+      v
+    GRUB
+      |
+      | next boot only
+      v
+Debian Installer
+      |
+      | network-console
+      v
+SSH as "installer"
+      |
+      | verify network and disks first
+      v
+Interactive Debian installation
+```
+
+The key principle is:
+
+> **Do not modify the partition table until you have successfully connected to the Debian Installer over SSH and verified the network and storage configuration.**
+
+---
+
+## Safety Model
+
+This project deliberately separates preparation from destructive installation.
+
+### `check`
+
+Performs environment and network checks.
+
+It does **not** modify files or boot settings.
+
+### `prepare`
+
+Prepares the Debian Installer:
+
+- detects the current network configuration
+- saves a system/network/storage snapshot
+- downloads the Debian 13 netboot kernel and initrd
+- verifies them against Debian's `SHA256SUMS`
+- generates a Debian Installer preseed
+- embeds the preseed into the installer initrd
+- enables Debian Installer `network-console`
+- generates a random temporary installer SSH password
+- creates a managed GRUB entry
+- regenerates `grub.cfg`
+- performs a GRUB syntax check when available
+
+It does **not**:
+
+- reboot the server
+- change partitions
+- format disks
+- install Debian
+- change the permanent GRUB default
+
+### `arm`
+
+Sets:
+
+```text
+next_entry=debian13-remote-installer
+```
+
+using `grub-reboot` / `grub2-reboot`.
+
+This causes the Debian Installer to be selected for the **next boot only**.
+
+It still does **not** reboot the machine.
+
+### `disarm`
+
+Clears the one-shot GRUB `next_entry`.
+
+Use this if you change your mind after running `arm` but before rebooting.
+
+### Debian Installer
+
+The installer itself remains interactive.
+
+There is intentionally **no automated partition recipe**.
+
+You must connect over SSH, verify the environment, and manually decide when to write changes to disk.
+
+---
+
+# Requirements
+
+Currently supported:
+
+- Debian 13 installer
+- amd64 / x86_64 servers
+- GRUB 2
+- an existing Linux installation
+- IPv4 networking
+- a simple physical network interface
+- approximately 80 MiB or more free under `/boot`
+- outbound HTTPS access to `deb.debian.org`
+
+The current script supports common GRUB layouts used by Debian/Ubuntu and RHEL-family systems.
+
+Useful commands expected on the existing system include:
+
+```text
+bash
+curl
+cpio
+gzip
+openssl
+sha256sum
+ip
+lsblk
+blkid
+findmnt
+grub-probe
+```
+
+and a supported GRUB configuration tool such as:
+
+```text
+update-grub
+grub2-mkconfig
+grub-mkconfig
+```
+
+---
+
+# Quick Start
+
+Make the script executable:
+
+```bash
+chmod +x debian13-remote-install.sh
+```
+
+## 1. Check the server
+
+Run this first:
+
+```bash
+sudo ./debian13-remote-install.sh check
+```
+
+This only performs checks.
+
+No boot configuration or files are changed.
+
+---
+
+## 2. Prepare the installer
+
+For a normal server with one static IPv4 address:
+
+```bash
+sudo ./debian13-remote-install.sh prepare
+```
+
+By default, the script detects the interface used by the IPv4 default route and copies its current IPv4 configuration into Debian Installer.
+
+For example, if the existing server uses:
+
+```text
+Interface: eno1
+Address:   203.0.113.50/24
+Gateway:   203.0.113.1
+DNS:       1.1.1.1 8.8.8.8
+```
+
+the installer will be configured with the same settings.
+
+---
+
+## 3. Review the prepared state
+
+```bash
+sudo ./debian13-remote-install.sh status
+```
+
+Check:
+
+- firmware mode
+- Secure Boot state
+- installer files
+- network settings
+- GRUB installer entry
+- GRUB `next_entry`
+
+---
+
+## 4. Arm the one-shot boot
+
+```bash
+sudo ./debian13-remote-install.sh arm
+```
+
+This does **not** reboot the server.
+
+Verify again:
+
+```bash
+sudo ./debian13-remote-install.sh status
+```
+
+You should see:
+
+```text
+GRUB next_entry: debian13-remote-installer
+```
+
+---
+
+## 5. Reboot manually
+
+Only after reviewing everything:
+
+```bash
+sudo reboot
+```
+
+The next boot should enter Debian Installer instead of the existing Linux installation.
+
+---
+
+## 6. Connect to Debian Installer
+
+The installer SSH username is:
+
+```text
+installer
+```
+
+The temporary password generated by `prepare` is stored at:
+
+```text
+/root/debian13-remote-install/installer-password.txt
+```
+
+For a static IP:
+
+```bash
+ssh installer@203.0.113.50
+```
+
+For DHCP:
+
+```bash
+ssh installer@<assigned-address>
+```
+
+---
+
+## 7. Verify before touching the disks
+
+Before starting the installation, open an installer shell and check:
+
+```bash
+ip -br link
+ip -br addr
+ip route
+cat /etc/resolv.conf
+lsblk
+```
+
+Verify at minimum:
+
+```text
+[ ] Correct network interface
+[ ] Correct IP address
+[ ] Correct default gateway
+[ ] Working DNS
+[ ] Correct target disk
+```
+
+Only after these checks should you start the installer and eventually allow it to write partition changes.
+
+---
+
+# Network Configuration
+
+## Automatically clone the current static IPv4 configuration
+
+This is the default:
+
+```bash
+sudo ./debian13-remote-install.sh prepare
+```
+
+Equivalent to:
+
+```bash
+sudo ./debian13-remote-install.sh prepare \
+    --network static
+```
+
+The script attempts to detect:
+
+- default-route interface
+- IPv4 address and prefix
+- gateway
+- DNS servers
+
+---
+
+## DHCP
+
+```bash
+sudo ./debian13-remote-install.sh prepare \
+    --network dhcp
+```
+
+Make sure you know how to discover the new DHCP lease after reboot.
+
+A DHCP reservation for the server's MAC address is strongly recommended.
+
+---
+
+## Explicit static configuration
+
+```bash
+sudo ./debian13-remote-install.sh prepare \
+    --network static \
+    --interface eno1 \
+    --address 203.0.113.50/24 \
+    --gateway 203.0.113.1 \
+    --dns "1.1.1.1 8.8.8.8"
+```
+
+---
+
+## Explicit Debian Installer interface
+
+If multiple NICs are present:
+
+```bash
+sudo ./debian13-remote-install.sh prepare \
+    --interface eno1 \
+    --installer-interface eno1
+```
+
+Do not assume that interface naming will always remain identical between the existing Linux system and Debian Installer.
+
+Verify the hardware and MAC addresses first.
+
+---
+
+# Commands
+
+```text
+debian13-remote-install.sh check [options]
+debian13-remote-install.sh prepare [options]
+debian13-remote-install.sh status
+debian13-remote-install.sh arm [options]
+debian13-remote-install.sh disarm
+debian13-remote-install.sh cleanup [--yes]
+```
+
+## `check`
+
+Validates the environment without making changes.
+
+```bash
+sudo ./debian13-remote-install.sh check
+```
+
+---
+
+## `prepare`
+
+Downloads and prepares the Debian Installer and creates the GRUB entry.
+
+```bash
+sudo ./debian13-remote-install.sh prepare
+```
+
+It does not reboot or modify partitions.
+
+---
+
+## `status`
+
+Displays the current bootstrap state.
+
+```bash
+sudo ./debian13-remote-install.sh status
+```
+
+---
+
+## `arm`
+
+Selects the installer for the next boot only.
+
+```bash
+sudo ./debian13-remote-install.sh arm
+```
+
+---
+
+## `disarm`
+
+Cancels an armed one-shot installer boot:
+
+```bash
+sudo ./debian13-remote-install.sh disarm
+```
+
+Use this before rebooting if anything looks wrong.
+
+---
+
+## `cleanup`
+
+Removes the managed GRUB entry and files created by this script:
+
+```bash
+sudo ./debian13-remote-install.sh cleanup
+```
+
+For non-interactive cleanup:
+
+```bash
+sudo ./debian13-remote-install.sh cleanup --yes
+```
+
+`cleanup` only removes the bootstrap files and the GRUB block managed by this script.
+
+---
+
+# Built-in Safety Checks
+
+Because losing SSH access may mean losing the server entirely, the script refuses several configurations by default.
+
+## Secure Boot
+
+If Secure Boot is enabled, the script stops because the existing shim/GRUB trust chain may not accept the Debian Installer kernel.
+
+Override:
+
+```bash
+--allow-secure-boot
+```
+
+Only use this after verifying the boot trust chain yourself.
+
+---
+
+## Multiple default-route interfaces
+
+Multiple IPv4 default-route interfaces are considered ambiguous.
+
+Specify the correct interface explicitly:
+
+```bash
+--interface eno1
+```
+
+---
+
+## Multiple active physical NICs
+
+If multiple physical NICs have carrier, automatic Debian Installer interface selection may be unsafe.
+
+Specify the intended interface or carefully override the check.
+
+---
+
+## Policy routing
+
+Non-standard IPv4 policy-routing rules cause the script to stop.
+
+Debian Installer will not automatically reproduce configurations such as:
+
+```text
+ip rule
+multiple routing tables
+source-based routing
+```
+
+Override:
+
+```bash
+--force-network
+```
+
+only if the additional routing rules are known to be unnecessary during installation.
+
+---
+
+## Bridge, bond, VLAN, and virtual uplinks
+
+The script expects the normal remote path to use a direct physical NIC.
+
+Configurations involving:
+
+- Linux bridges
+- bonding
+- VLAN interfaces
+- other virtual network devices
+
+are rejected by default.
+
+Override:
+
+```bash
+--force-network
+```
+
+only after designing a valid installer network path.
+
+---
+
+# GRUB One-Shot Boot and Rollback
+
+The project relies on GRUB's `next_entry` mechanism.
+
+Normally:
+
+```text
+Existing Linux
+      |
+      | grub-reboot
+      v
+Debian Installer
+      |
+      | next_entry consumed
+      v
+Next power cycle
+      |
+      v
+Normal GRUB default
+```
+
+This provides an important recovery property:
+
+If Debian Installer fails **before the original system has been modified**, a subsequent power cycle may return to the original Linux installation.
+
+However, this only works if GRUB can update its environment block.
+
+---
+
+## Unsupported or risky `/boot` layouts
+
+GRUB may be unable to reliably clear `next_entry` on some configurations, including certain:
+
+- LVM setups
+- MD RAID setups
+- Btrfs setups
+- ZFS setups
+- other GRUB abstraction layers
+
+The script checks `/boot` with `grub-probe` and refuses suspicious configurations by default.
+
+Override:
+
+```bash
+--force-grubenv
+```
+
+This significantly weakens the one-shot rollback guarantee.
+
+Use it only if you understand the GRUB environment-block behavior of the server.
+
+---
+
+# The Point of No Return
+
+Before the Debian Installer writes to disk, the original Linux system is normally still intact.
+
+The critical transition is approximately:
+
+```text
+Debian Installer
+      |
+      | network verified
+      | storage verified
+      v
+Finish partitioning
+      |
+      v
+Write changes to disk
+      |
+      v
+POINT OF NO RETURN
+```
+
+Once the original root filesystem or partition table has been overwritten, GRUB one-shot rollback can no longer restore the old system.
+
+From that point onward, failures involving:
+
+- GRUB installation
+- initramfs
+- network configuration
+- interface naming
+- SSH configuration
+- filesystem mounting
+
+may require physical or out-of-band console access.
+
+---
+
+# Files Created
+
+The script stores its working state under:
+
+```text
+/root/debian13-remote-install/
+```
+
+Important files include:
+
+```text
+/root/debian13-remote-install/state.env
+/root/debian13-remote-install/preseed.cfg
+/root/debian13-remote-install/installer-password.txt
+/root/debian13-remote-install/installer-local.sha256
+/root/debian13-remote-install/system-snapshot/
+```
+
+Installer boot files are stored under:
+
+```text
+/boot/debian13-remote-install/
+```
+
+The script manages its GRUB entry inside:
+
+```text
+/etc/grub.d/40_custom
+```
+
+between markers:
+
+```text
+# BEGIN debian13-remote-install
+...
+# END debian13-remote-install
+```
+
+Existing unrelated entries in `40_custom` are preserved.
+
+---
+
+# System Snapshot
+
+Before preparing the installer, the script records useful recovery and diagnostic information, including:
+
+- kernel and OS information
+- block devices
+- filesystem UUIDs
+- mount layout
+- IP addresses
+- routes
+- routing policy
+- all routing tables
+- DNS configuration
+- PCI device information
+- firmware mode
+- Secure Boot state
+- default interface and MAC address
+
+The snapshot is stored under:
+
+```text
+/root/debian13-remote-install/system-snapshot/
+```
+
+This directory is on the existing system and will normally disappear if that filesystem is later reformatted.
+
+Copy anything important elsewhere before starting the destructive part of the installation.
+
+---
+
+# Security Notes
+
+## Temporary installer password
+
+`prepare` generates a random temporary password for Debian Installer's SSH `network-console`.
+
+It is stored locally as:
+
+```text
+/root/debian13-remote-install/installer-password.txt
+```
+
+and is also embedded in the generated installer preseed/initrd.
+
+Treat the generated installer files as sensitive.
+
+---
+
+## Restrict SSH exposure
+
+If the server is directly exposed to the Internet, consider temporarily restricting TCP port 22 to your management IP using:
+
+- provider firewall rules
+- security groups
+- upstream ACLs
+
+before booting Debian Installer.
+
+---
+
+## Host key verification
+
+The Debian Installer will generate a new SSH host key.
+
+Because this project targets systems without a remote console, independently verifying the installer SSH fingerprint may not always be possible.
+
+A provider-level source IP restriction significantly reduces this risk.
+
+---
+
+# What This Project Does Not Do
+
+`nokvm-reinstall` currently does **not**:
+
+- automatically partition disks
+- automatically format disks
+- perform a fully unattended reinstall
+- automatically reboot the server
+- automatically configure the final Debian system
+- handle application migration
+- preserve existing data
+- support encrypted boot requiring interactive unlock
+- reproduce complex network topologies
+- guarantee recovery after disk modifications
+- replace KVM/IPMI/out-of-band management
+
+It is a **bootstrap and safety tool**, not a complete remote provisioning system.
+
+---
+
+# Current Limitations
+
+Version `0.2.0` currently targets:
+
+```text
+Architecture: amd64 / x86_64
+Distribution: Debian 13 / trixie
+Bootloader:   GRUB 2
+Networking:   IPv4
+Installer:    Debian Installer network-console
+```
+
+Complex environments should be treated as unsupported until explicitly tested.
+
+Examples include:
+
+- `/32` provider addressing with an off-subnet gateway
+- routed subnet setups
+- IPv6-only servers
+- VLAN-only uplinks
+- bonded interfaces
+- bridge-only uplinks
+- software-defined networking
+- complex policy routing
+- unusual software RAID boot layouts
+- encrypted root requiring console interaction
+- systems not using GRUB
+
+---
+
+# Recommended Operational Procedure
+
+For remote production servers, use this sequence:
+
+```text
+1. Verify that an out-of-band power cycle is available if possible.
+
+2. Run:
+      ./debian13-remote-install.sh check
+
+3. Review all detected network and boot information.
+
+4. Run:
+      ./debian13-remote-install.sh prepare
+
+5. Run:
+      ./debian13-remote-install.sh status
+
+6. Save the installer password somewhere outside the server.
+
+7. Run:
+      ./debian13-remote-install.sh arm
+
+8. Run:
+      ./debian13-remote-install.sh status
+
+9. Reboot manually.
+
+10. SSH to:
+      installer@SERVER_IP
+
+11. Verify:
+      ip addr
+      ip route
+      DNS
+      NIC MAC
+      lsblk
+
+12. Only then start Debian Installer.
+
+13. Before writing partition changes, verify the target disk again.
+
+14. Install a minimal Debian system with SSH.
+
+15. Before the final reboot, verify the target network configuration
+    and OpenSSH installation if possible.
+
+16. Reboot into Debian 13.
+
+17. Verify SSH access before performing additional hardening.
+```
+
+---
+
+# Project Status
+
+This project performs bootloader and remote-install preparation on machines that may have no recovery console.
+
+It should therefore be considered an **advanced administrative tool**.
+
+Test it on non-critical hardware or virtual machines before using it on production infrastructure.
+
+Pull requests and reports for additional GRUB, distribution, storage, and network configurations are welcome.
+
+---
+
+# Disclaimer
+
+**This software can contribute to permanent loss of remote access or data if used incorrectly.**
+
+There is no software-only recovery guarantee once the existing operating system, partition table, bootloader, or network configuration has been modified.
+
+Use an out-of-band management interface whenever one is available.
+
+You are responsible for:
+
+- verifying backups
+- identifying the correct disks
+- verifying networking
+- understanding the server's boot configuration
+- maintaining a recovery path
+
+Use at your own risk.
